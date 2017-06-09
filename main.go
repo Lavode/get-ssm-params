@@ -1,19 +1,27 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/ssm"
 )
 
-const appVersion = "1.0.0"
+// AppVersion is set at compile time
+var AppVersion = "0.0.0-dev"
 
 func main() {
 	var defaultRegion string
@@ -28,27 +36,70 @@ func main() {
 	var extraparams = flag.String("extraparams", os.Getenv("SSM_EXTRA_PARAMS"), "[$SSM_EXTRA_PARAMS] parameters to fetch (explicit)")
 	var awsregion = flag.String("awsregion", defaultRegion, "[$SSM_AWS_REGION] AWS region")
 	var printVersion = flag.Bool("version", false, "Print version of get-ssm-params")
+	var s3Get = flag.Bool("s3-get", false, "fetch file from S3, args: [bucket] [key] [localFile]")
 	flag.Parse()
 
 	if *printVersion {
-		fmt.Println(appVersion)
+		fmt.Println(AppVersion)
 		os.Exit(0)
 	}
 	os.Setenv("AWS_REGION", *awsregion)
-
-	// retrieve desired parameters via API
 	sess := session.Must(session.NewSession())
+
+	// retrieve single file from S3 if '-s3-get' was given
+	if *s3Get {
+		if len(flag.Args()) == 3 {
+			s3GetFile(sess, flag.Args()[0], flag.Args()[1], flag.Args()[2])
+			os.Exit(0)
+		}
+		fmt.Println("Bad usage, try: get-ssm-params --s3-get bucket key localName")
+		os.Exit(1)
+	}
+
+	// by default, get SSM parameters
+	ssmGet(sess, environment, service, envparams, extraparams)
+}
+
+func s3GetFile(sess *session.Session, bucket, key, localPath string) {
+	svc := s3.New(sess)
+	var timeout = time.Second * 30
+	ctx := context.Background()
+	var cancelFn func()
+	ctx, cancelFn = context.WithTimeout(ctx, timeout)
+	defer cancelFn()
+	var input = &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	}
+
+	o, err := svc.GetObjectWithContext(ctx, input)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == request.CanceledErrorCode {
+			errorExit("Download canceled due to timeout", err)
+		} else {
+			errorExit("Failed to download object", err)
+		}
+	}
+
+	// slurp S3 file into memory, assuming small files...
+	body, err := ioutil.ReadAll(o.Body)
+	errorExit("reading body", err)
+
+	// write file from memory to disk
+	err = ioutil.WriteFile(localPath, body, 0644)
+	errorExit(fmt.Sprintf("writing %s", localPath), err)
+
+	fmt.Printf("SUCCESS Fetching 's3://%s/%s' -> '%s' (%d bytes)\n", bucket, key, localPath, *o.ContentLength)
+}
+
+func ssmGet(sess *session.Session, environment, service, envparams, extraparams *string) {
 	svc := ssm.New(sess)
 	params := &ssm.GetParametersInput{
 		Names:          cliParams(*environment, *service, *envparams, *extraparams),
 		WithDecryption: aws.Bool(true),
 	}
 	resp, err := svc.GetParameters(params)
-
-	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
-	}
+	errorExit("GetParameters", err)
 
 	// exit(1) if user requested parameters that do not exist (fail early...)
 	if len(resp.InvalidParameters) > 0 {
@@ -71,9 +122,7 @@ func main() {
 		}
 		env := os.Environ()
 		execErr := syscall.Exec(flag.Args()[0], flag.Args(), env)
-		if execErr != nil {
-			panic(execErr)
-		}
+		errorExit("Failed to execute", execErr)
 	}
 }
 
@@ -84,8 +133,7 @@ func cliParams(env string, service string, params string, extraparams string) []
 	// handle env/svc specific -params
 	if params != "" {
 		if env == "" || service == "" {
-			fmt.Println("ERROR: -env and -service must be given for -params to work")
-			os.Exit(1)
+			errorExit("bad arguments", errors.New("-env and -service must be given for -params to work"))
 		}
 		pp := strings.Split(params, ",")
 		for _, arg := range pp {
@@ -102,19 +150,22 @@ func cliParams(env string, service string, params string, extraparams string) []
 	}
 
 	if len(p) == 0 {
-		fmt.Println("Usage:")
-		fmt.Println("  get-ssm-params [-env ENV] [-service SVC] [-params PARAMS] [-extraparams XPARAMS] [...command...]")
-		fmt.Println(" or")
-		fmt.Println("  SSM_PARAMS='foo,bar' SSM_ENV=PROD SSM_SERVICE=MINE SSM_ENTRYPOINT='npm run prod' get-ssm-params [...command...]")
-		os.Exit(1)
+		errorExit("bad usage", errors.New("try -h for help"))
 	}
-
 	return p
 }
 
-// stripEnvAndService strips environment name and service name from <in>,
+// strnilipEnvAndService strips environment name and service name from <in>,
 // eg. PROD_FOO_DB_USER -> DB_USER
 func stripEnvAndService(in string, env string, service string) string {
 	reg, _ := regexp.Compile("^" + env + "_" + service + "_")
 	return reg.ReplaceAllString(in, "")
+}
+
+// errorExit bails out on error
+func errorExit(msg string, e error) {
+	if e != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %s, %v\n", msg, e)
+		os.Exit(1)
+	}
 }
