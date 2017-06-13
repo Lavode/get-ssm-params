@@ -14,6 +14,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -35,6 +36,7 @@ func main() {
 	var envparams = flag.String("params", os.Getenv("SSM_PARAMS"), "[$SSM_PARAMS] parameters to fetch (prefixes env+service)")
 	var extraparams = flag.String("extraparams", os.Getenv("SSM_EXTRA_PARAMS"), "[$SSM_EXTRA_PARAMS] parameters to fetch (explicit)")
 	var awsregion = flag.String("awsregion", defaultRegion, "[$SSM_AWS_REGION] AWS region")
+	var roleARN = flag.String("rolearn", os.Getenv("SSM_ROLEARN"), "[$SSM_ROLE_ARN] use given IAM role (ARN)")
 	var printVersion = flag.Bool("version", false, "Print version of get-ssm-params")
 	var s3Get = flag.Bool("s3-get", false, "fetch file from S3, args: [bucket] [key] [localFile]")
 	flag.Parse()
@@ -49,7 +51,7 @@ func main() {
 	// retrieve single file from S3 if '-s3-get' was given
 	if *s3Get {
 		if len(flag.Args()) == 3 {
-			s3GetFile(sess, flag.Args()[0], flag.Args()[1], flag.Args()[2])
+			s3GetFile(sess, *roleARN, flag.Args()[0], flag.Args()[1], flag.Args()[2])
 			os.Exit(0)
 		}
 		fmt.Println("Bad usage, try: get-ssm-params --s3-get bucket key localName")
@@ -57,11 +59,17 @@ func main() {
 	}
 
 	// by default, get SSM parameters
-	ssmGet(sess, environment, service, envparams, extraparams)
+	ssmGet(sess, *roleARN, environment, service, envparams, extraparams)
 }
 
-func s3GetFile(sess *session.Session, bucket, key, localPath string) {
-	svc := s3.New(sess)
+func s3GetFile(sess *session.Session, arn string, bucket, key, localPath string) {
+	sessConfig := &aws.Config{}
+	if arn != "" {
+		creds := stscreds.NewCredentials(sess, arn)
+		sessConfig = &aws.Config{Credentials: creds}
+	}
+	svc := s3.New(sess, sessConfig)
+
 	var timeout = time.Second * 30
 	ctx := context.Background()
 	var cancelFn func()
@@ -92,8 +100,13 @@ func s3GetFile(sess *session.Session, bucket, key, localPath string) {
 	fmt.Printf("SUCCESS Fetching 's3://%s/%s' -> '%s' (%d bytes)\n", bucket, key, localPath, *o.ContentLength)
 }
 
-func ssmGet(sess *session.Session, environment, service, envparams, extraparams *string) {
-	svc := ssm.New(sess)
+func ssmGet(sess *session.Session, arn string, environment, service, envparams, extraparams *string) {
+	sessConfig := &aws.Config{}
+	if arn != "" {
+		creds := stscreds.NewCredentials(sess, arn)
+		sessConfig = &aws.Config{Credentials: creds}
+	}
+	svc := ssm.New(sess, sessConfig)
 	params := &ssm.GetParametersInput{
 		Names:          cliParams(*environment, *service, *envparams, *extraparams),
 		WithDecryption: aws.Bool(true),
