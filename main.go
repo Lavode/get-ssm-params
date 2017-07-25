@@ -45,6 +45,15 @@ func main() {
 		fmt.Println(AppVersion)
 		os.Exit(0)
 	}
+
+	// just exec() if SSM_PARAMS not set -- used to run/test containers outside of ECS
+	if *envparams == "" && len(flag.Args()) > 0 {
+		fmt.Println("Notice: No SSM_PARAMS provided to get-ssm-params. Passing through to exec().")
+		env := os.Environ()
+		execErr := syscall.Exec(flag.Args()[0], flag.Args(), env)
+		errorExit("Failed to execute", execErr)
+	}
+
 	os.Setenv("AWS_REGION", *awsregion)
 	sess := session.Must(session.NewSession())
 
