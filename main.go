@@ -116,35 +116,42 @@ func ssmGet(sess *session.Session, arn string, environment, service, envparams, 
 		sessConfig = &aws.Config{Credentials: creds}
 	}
 	svc := ssm.New(sess, sessConfig)
-	params := &ssm.GetParametersInput{
-		Names:          cliParams(*environment, *service, *envparams, *extraparams),
-		WithDecryption: aws.Bool(true),
-	}
-	resp, err := svc.GetParameters(params)
-	errorExit("GetParameters", err)
+	preparedCliParams := cliParams(*environment, *service, *envparams, *extraparams)
+	for i := 0; i < len(preparedCliParams); i = i + 10 {
+		lastElement := i + 10
+		if len(preparedCliParams) < lastElement {
+			lastElement = len(preparedCliParams)
+		}
+		params := &ssm.GetParametersInput{
+			Names:          preparedCliParams[i:lastElement],
+			WithDecryption: aws.Bool(true),
+		}
+		resp, err := svc.GetParameters(params)
+		errorExit("GetParameters", err)
 
-	// exit(1) if user requested parameters that do not exist (fail early...)
-	if len(resp.InvalidParameters) > 0 {
-		fmt.Println("ERROR: Invalid/Unavailable parameter(s):")
-		for _, p := range resp.InvalidParameters {
-			fmt.Printf("  - %s\n", *p)
+		// exit(1) if user requested parameters that do not exist (fail early...)
+		if len(resp.InvalidParameters) > 0 {
+			fmt.Println("ERROR: Invalid/Unavailable parameter(s):")
+			for _, p := range resp.InvalidParameters {
+				fmt.Printf("  - %s\n", *p)
+			}
+			os.Exit(1)
 		}
-		os.Exit(1)
-	}
 
-	if len(flag.Args()) == 0 {
-		// print all the valid parameters we have, ready-to-source
-		for _, p := range resp.Parameters {
-			fmt.Printf(`%s="%s"`+"\n", stripEnvAndService(*p.Name, *environment, *service), *p.Value)
+		if len(flag.Args()) == 0 {
+			// print all the valid parameters we have, ready-to-source
+			for _, p := range resp.Parameters {
+				fmt.Printf(`%s="%s"`+"\n", stripEnvAndService(*p.Name, *environment, *service), *p.Value)
+			}
+		} else {
+			// execute given entrypoint with parameters added to environment
+			for _, p := range resp.Parameters {
+				os.Setenv(stripEnvAndService(*p.Name, *environment, *service), *p.Value)
+			}
+			env := os.Environ()
+			execErr := syscall.Exec(flag.Args()[0], flag.Args(), env)
+			errorExit("Failed to execute", execErr)
 		}
-	} else {
-		// execute given entrypoint with parameters added to environment
-		for _, p := range resp.Parameters {
-			os.Setenv(stripEnvAndService(*p.Name, *environment, *service), *p.Value)
-		}
-		env := os.Environ()
-		execErr := syscall.Exec(flag.Args()[0], flag.Args(), env)
-		errorExit("Failed to execute", execErr)
 	}
 }
 
